@@ -23,6 +23,7 @@ from sympy.functions import Piecewise, sqrt, sign
 from sympy.functions.elementary.exponential import log
 from sympy.series import limit
 from sympy.series.order import Order
+from sympy.series.formal import FormalPowerSeries
 
 
 class Integral(AddWithLimits):
@@ -92,7 +93,7 @@ class Integral(AddWithLimits):
         >>> from sympy import Integral
         >>> from sympy.abc import x, y
         >>> Integral(x, (x, y, 1)).free_symbols
-        set([y])
+        {y}
 
         See Also
         ========
@@ -379,6 +380,8 @@ class Integral(AddWithLimits):
         conds = hints.get('conds', 'piecewise')
         risch = hints.get('risch', None)
         manual = hints.get('manual', None)
+        eval_kwargs = dict(meijerg=meijerg, risch=risch, manual=manual,
+            conds=conds)
 
         if conds not in ['separate', 'piecewise', 'none']:
             raise ValueError('conds must be one of "separate", "piecewise", '
@@ -398,10 +401,22 @@ class Integral(AddWithLimits):
         if function.is_zero:
             return S.Zero
 
+        # hacks to handle special cases
         if isinstance(function, MatrixBase):
-            return function.applyfunc(lambda f: self.func(f, self.limits).doit(**hints))
+            return function.applyfunc(
+                lambda f: self.func(f, self.limits).doit(**hints))
 
-        # There is no trivial answer, so continue
+        if isinstance(function, FormalPowerSeries):
+            if len(self.limits) > 1:
+                raise NotImplementedError
+            xab = self.limits[0]
+            if len(xab) > 1:
+                return function.integrate(xab, **eval_kwargs)
+            else:
+                return function.integrate(xab[0], **eval_kwargs)
+
+        # There is no trivial answer and special handling
+        # is done so continue
 
         undone_limits = []
         # ulj = free symbols of any undone limits' upper and lower limits
@@ -428,67 +443,78 @@ class Integral(AddWithLimits):
                     function = factored_function
                 continue
 
-            # There are a number of tradeoffs in using the Meijer G method.
-            # It can sometimes be a lot faster than other methods, and
-            # sometimes slower. And there are certain types of integrals for
-            # which it is more likely to work than others.
-            # These heuristics are incorporated in deciding what integration
-            # methods to try, in what order.
-            # See the integrate() docstring for details.
-            def try_meijerg(function, xab):
-                ret = None
-                if len(xab) == 3 and meijerg is not False:
-                    x, a, b = xab
-                    try:
-                        res = meijerint_definite(function, x, a, b)
-                    except NotImplementedError:
-                        from sympy.integrals.meijerint import _debug
-                        _debug('NotImplementedError from meijerint_definite')
-                        res = None
-                    if res is not None:
-                        f, cond = res
-                        if conds == 'piecewise':
-                            ret = Piecewise((f, cond),
-                                          (self.func(function, (x, a, b)), True))
-                        elif conds == 'separate':
-                            if len(self.limits) != 1:
-                                raise ValueError('conds=separate not supported in '
-                                                 'multiple integrals')
-                            ret = f, cond
-                        else:
-                            ret = f
-                return ret
-
-            meijerg1 = meijerg
-            if len(xab) == 3 and xab[1].is_real and xab[2].is_real \
-                and not function.is_Poly and \
-                    (xab[1].has(oo, -oo) or xab[2].has(oo, -oo)):
-                ret = try_meijerg(function, xab)
-                if ret is not None:
-                    function = ret
-                    continue
+            if isinstance(function, Piecewise):
+                # TODO pass along eval_kwargs
+                if len(xab) == 1:
+                    antideriv = function._eval_integral(xab[0])
                 else:
-                    meijerg1 = False
-
-            # If the special meijerg code did not succeed in finding a definite
-            # integral, then the code using meijerint_indefinite will not either
-            # (it might find an antiderivative, but the answer is likely to be
-            #  nonsensical).
-            # Thus if we are requested to only use Meijer G-function methods,
-            # we give up at this stage. Otherwise we just disable G-function
-            # methods.
-            if meijerg1 is False and meijerg is True:
-                antideriv = None
+                    antideriv = self._eval_integral(
+                        function, xab[0])
             else:
-                antideriv = self._eval_integral(
-                    function, xab[0],
-                    meijerg=meijerg1, risch=risch, manual=manual,
-                    conds=conds)
-                if antideriv is None and meijerg1 is True:
+                # There are a number of tradeoffs in using the
+                # Meijer G method. It can sometimes be a lot faster
+                # than other methods, and sometimes slower. And
+                # there are certain types of integrals for which it
+                # is more likely to work than others. These
+                # heuristics are incorporated in deciding what
+                # integration methods to try, in what order. See the
+                # integrate() docstring for details.
+                def try_meijerg(function, xab):
+                    ret = None
+                    if len(xab) == 3 and meijerg is not False:
+                        x, a, b = xab
+                        try:
+                            res = meijerint_definite(function, x, a, b)
+                        except NotImplementedError:
+                            from sympy.integrals.meijerint import _debug
+                            _debug('NotImplementedError '
+                                'from meijerint_definite')
+                            res = None
+                        if res is not None:
+                            f, cond = res
+                            if conds == 'piecewise':
+                                ret = Piecewise(
+                                    (f, cond),
+                                    (self.func(
+                                    function, (x, a, b)), True))
+                            elif conds == 'separate':
+                                if len(self.limits) != 1:
+                                    raise ValueError(filldedent('''
+                                        conds=separate not supported in
+                                        multiple integrals'''))
+                                ret = f, cond
+                            else:
+                                ret = f
+                    return ret
+
+                meijerg1 = meijerg
+                if (meijerg is not False and
+                        len(xab) == 3 and xab[1].is_real and xab[2].is_real
+                        and not function.is_Poly and
+                        (xab[1].has(oo, -oo) or xab[2].has(oo, -oo))):
                     ret = try_meijerg(function, xab)
                     if ret is not None:
                         function = ret
                         continue
+                    meijerg1 = False
+                # If the special meijerg code did not succeed in
+                # finding a definite integral, then the code using
+                # meijerint_indefinite will not either (it might
+                # find an antiderivative, but the answer is likely
+                # to be nonsensical). Thus if we are requested to
+                # only use Meijer G-function methods, we give up at
+                # this stage. Otherwise we just disable G-function
+                # methods.
+                if meijerg1 is False and meijerg is True:
+                    antideriv = None
+                else:
+                    antideriv = self._eval_integral(
+                        function, xab[0], **eval_kwargs)
+                    if antideriv is None and meijerg is True:
+                        ret = try_meijerg(function, xab)
+                        if ret is not None:
+                            function = ret
+                            continue
 
             if antideriv is None:
                 undone_limits.append(xab)
@@ -592,7 +618,7 @@ class Integral(AddWithLimits):
         The previous must be true since there is no y in the evaluated integral:
 
         >>> i.free_symbols
-        set([x])
+        {x}
         >>> i.doit()
         2*x**3/3 - x/2 - 1/6
 
@@ -733,6 +759,7 @@ class Integral(AddWithLimits):
 
         """
         from sympy.integrals.deltafunctions import deltaintegrate
+        from sympy.integrals.singularityfunctions import singularityintegrate
         from sympy.integrals.heurisch import heurisch, heurisch_wrapper
         from sympy.integrals.rationaltools import ratint
         from sympy.integrals.risch import risch_integrate
@@ -762,10 +789,11 @@ class Integral(AddWithLimits):
             return f.integrate(x)
 
         # Piecewise antiderivatives need to call special integrate.
-        if f.func is Piecewise:
-            return f._eval_integral(x)
+        if isinstance(f, Piecewise):
+            return f._eval_integral(x)  # TODO change to .piecewise_integrate(x)
 
-        # let's cut it short if `f` does not depend on `x`
+        # let's cut it short if `f` does not depend on `x`; if
+        # x is only a dummy, that will be handled below
         if not f.has(x):
             return f*x
 
@@ -776,13 +804,22 @@ class Integral(AddWithLimits):
 
         if risch is not False:
             try:
-                result, i = risch_integrate(f, x, separate_integral=True, conds=conds)
+                result, i = risch_integrate(f, x, separate_integral=True,
+                    conds=conds)
             except NotImplementedError:
                 pass
             else:
                 if i:
                     # There was a nonelementary integral. Try integrating it.
-                    return result + i.doit(risch=False)
+
+                    # if no part of the NonElementaryIntegral is integrated by
+                    # the Risch algorithm, then use the original function to
+                    # integrate, instead of re-written one
+                    if result == 0:
+                        from sympy.integrals.risch import NonElementaryIntegral
+                        return NonElementaryIntegral(f, x).doit(risch=False)
+                    else:
+                        return result + i.doit(risch=False)
                 else:
                     return result
 
@@ -864,6 +901,12 @@ class Integral(AddWithLimits):
 
                 # g(x) has at least a DiracDelta term
                 h = deltaintegrate(g, x)
+                if h is not None:
+                    parts.append(coeff * h)
+                    continue
+
+                # g(x) has at least a Singularity Function term
+                h = singularityintegrate(g, x)
                 if h is not None:
                     parts.append(coeff * h)
                     continue
@@ -973,7 +1016,15 @@ class Integral(AddWithLimits):
                 break
         terms, order = expr.function.nseries(
             x=symb, n=n, logx=logx).as_coeff_add(Order)
+        order = [o.subs(symb, x) for o in order]
         return integrate(terms, *expr.limits) + Add(*order)*x
+
+    def _eval_as_leading_term(self, x):
+        series_gen = self.args[0].lseries(x)
+        for leading_term in series_gen:
+            if leading_term != 0:
+                break
+        return integrate(leading_term, *self.args[1:])
 
     def as_sum(self, n, method="midpoint"):
         """
